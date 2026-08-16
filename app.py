@@ -3,6 +3,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from ytmusicapi import YTMusic
 import yt_dlp
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -37,44 +38,53 @@ def get_stream(video_id):
     if video_id in stream_cache:
         return jsonify({"url": stream_cache[video_id]})
     
-    # Updated to use 'tv' and 'ios' clients to bypass YouTube's cloud bot protection
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv', 'ios', 'android', 'web']
-            }
-        }
-    }
-    
+    # 1. Try yt-dlp first
     try:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            
-            # Safely extract the stream URL from the formats list
             stream_url = info.get('url')
             if not stream_url and 'formats' in info:
-                best_audio = None
                 for f in info['formats']:
                     if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                        if best_audio is None or f.get('abr', 0) > best_audio.get('abr', 0):
-                            best_audio = f
-                if best_audio:
-                    stream_url = best_audio['url']
-                elif info['formats']:
-                    stream_url = info['formats'][-1]['url']
-            
+                        stream_url = f['url']
+                        break
             if stream_url:
                 stream_cache[video_id] = stream_url
                 return jsonify({"url": stream_url})
-            else:
-                return jsonify({"error": "Could not extract audio URL"}), 500
-                    
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"yt-dlp failed: {e}")
+    
+    # 2. Fallback to Piped API (Bypasses YouTube cloud blocks)
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://api.piped.yt"
+    ]
+    
+    for instance in piped_instances:
+        try:
+            res = requests.get(f"{instance}/streams/{video_id}", timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get('audioStreams'):
+                    best_audio = data['audioStreams'][0]
+                    for stream in data['audioStreams']:
+                        if stream.get('quality') == '256' or stream.get('quality', '0') > best_audio.get('quality', '0'):
+                            best_audio = stream
+                    stream_url = best_audio.get('url')
+                    if stream_url:
+                        stream_cache[video_id] = stream_url
+                        return jsonify({"url": stream_url})
+        except Exception as e:
+            print(f"Piped instance {instance} failed: {e}")
+            
+    return jsonify({"error": "Could not extract audio URL from any source"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
