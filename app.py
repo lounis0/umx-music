@@ -1,95 +1,90 @@
 import os
+import json
+import uuid
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from ytmusicapi import YTMusic
-import yt_dlp
-import requests
 
 app = Flask(__name__)
 CORS(app)
-ytmusic = YTMusic()
-stream_cache = {}
+
+# Owner Credentials saved directly in Python
+OWNER_USER = "admin"
+OWNER_PASS = "umx123" # Change this to whatever you want!
+VALID_TOKENS = set() # Stores active login sessions
+
+DB_FILE = "posts.json"
+
+# Helper to load posts from file
+def load_posts():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+# Helper to save posts to file
+def save_posts(posts):
+    with open(DB_FILE, 'w') as f:
+        json.dump(posts, f)
 
 @app.route('/')
 def home():
-    return "UMX Backend is running!"
+    return "UMX Blog Backend is running!"
 
-@app.route('/api/search')
-def search():
-    query = request.args.get('q')
-    if not query: return jsonify([])
-    results = ytmusic.search(query, filter="songs", limit=20)
-    songs = []
-    for item in results:
-        if item.get('videoId'):
-            artists = ', '.join([a['name'] for a in item.get('artists', [])])
-            thumbs = item.get('thumbnails', [])
-            cover = thumbs[-1]['url'] if thumbs else ''
-            songs.append({
-                "id": item['videoId'],
-                "title": item.get('title', 'Unknown'),
-                "artist": artists,
-                "cover": cover
-            })
-    return jsonify(songs)
+# ======= USER ENDPOINTS =======
 
-@app.route('/api/stream/<video_id>')
-def get_stream(video_id):
-    if video_id in stream_cache:
-        return jsonify({"url": stream_cache[video_id]})
-    
-    # 1. Try yt-dlp first (in case it isn't blocked)
-    try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web']
-                }
-            }
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            stream_url = info.get('url')
-            if not stream_url and 'formats' in info:
-                for f in info['formats']:
-                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                        stream_url = f['url']
-                        break
-            if stream_url:
-                stream_cache[video_id] = stream_url
-                return jsonify({"url": stream_url})
-    except Exception as e:
-        print(f"yt-dlp failed for {video_id}: {e}")
-    
-    # 2. Fallback to Piped API (Bypasses YouTube cloud blocks)
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.adminforge.de",
-        "https://api.piped.yt"
-    ]
-    
-    for instance in piped_instances:
-        try:
-            res = requests.get(f"{instance}/streams/{video_id}", timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('audioStreams'):
-                    best_audio = data['audioStreams'][0]
-                    for stream in data['audioStreams']:
-                        if stream.get('quality') == '256' or stream.get('quality', '0') > best_audio.get('quality', '0'):
-                            best_audio = stream
-                    stream_url = best_audio.get('url')
-                    if stream_url:
-                        stream_cache[video_id] = stream_url
-                        return jsonify({"url": stream_url})
-        except Exception as e:
-            print(f"Piped instance {instance} failed: {e}")
-            
-    return jsonify({"error": "Could not extract audio URL from any source"}), 500
+@app.route('/api/posts', methods=['GET'])
+def get_posts():
+    posts = load_posts()
+    # Return newest first
+    return jsonify(posts[::-1])
+
+# ======= OWNER ENDPOINTS =======
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    if data.get('username') == OWNER_USER and data.get('password') == OWNER_PASS:
+        token = str(uuid.uuid4())
+        VALID_TOKENS.add(token)
+        return jsonify({"token": token})
+    return jsonify({"error": "Invalid credentials"}), 401
+
+@app.route('/api/publish', methods=['POST'])
+def publish():
+    token = request.headers.get('Authorization')
+    if token not in VALID_TOKENS:
+        return jsonify({"error": "Unauthorized"}), 403
+        
+    data = request.json
+    posts = load_posts()
+    new_post = {
+        "id": str(uuid.uuid4())[:8],
+        "title": data.get('title', 'Untitled'),
+        "content": data.get('content', ''),
+        "date": data.get('date', 'Today')
+    }
+    posts.append(new_post)
+    save_posts(posts)
+    return jsonify({"success": True, "post": new_post})
+
+@app.route('/api/stats', methods=['GET'])
+def stats():
+    token = request.headers.get('Authorization')
+    if token not in VALID_TOKENS:
+        return jsonify({"error": "Unauthorized"}), 403
+        
+    posts = load_posts()
+    total_words = sum(len(p['content'].split()) for p in posts)
+    return jsonify({"total_posts": len(posts), "total_words": total_words})
+
+@app.route('/api/reset', methods=['DELETE'])
+def reset():
+    token = request.headers.get('Authorization')
+    if token not in VALID_TOKENS:
+        return jsonify({"error": "Unauthorized"}), 403
+        
+    save_posts([]) # Delete all posts
+    return jsonify({"success": True, "message": "All posts deleted."})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
