@@ -8,9 +8,11 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-BOT_TOKEN = os.environ.get("TG_TOKEN", "")
-CHAT_ID = os.environ.get("TG_CHAT", "")
+# Load credentials from environment variables (Render), fallback to manual entry for local testing
+BOT_TOKEN = os.environ.get("TG_TOKEN", "8860704156:AAGXX4Mw4ipym9FAe7XD3CJkp8mSJ_qft_8")
+CHAT_ID = os.environ.get("TG_CHAT", "7561882897")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 DB_FILE = "files.json"
 
 def load_db():
@@ -62,7 +64,7 @@ def upload_file():
             db.append(new_file)
             save_db(db)
             return jsonify({"success": True, "file": new_file})
-        return jsonify({"error": "Telegram upload failed"}), 500
+        return jsonify({"error": "Telegram upload failed", "details": resp.text}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -100,5 +102,5 @@ def delete_file(file_id):
     return jsonify({"success": True})
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    # This allows you to run it locally on port 8000
+    app.run(host='0.0.0.0', port=8000, debug=True)
