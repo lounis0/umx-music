@@ -37,7 +37,7 @@ def get_stream(video_id):
     if video_id in stream_cache:
         return jsonify({"url": stream_cache[video_id]})
     
-    # Updated to use the 'android' client to bypass YouTube bot protection on cloud servers
+    # Updated to use 'tv' and 'ios' clients to bypass YouTube's cloud bot protection
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
@@ -45,24 +45,27 @@ def get_stream(video_id):
         'skip_download': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web']
+                'player_client': ['tv', 'ios', 'android', 'web']
             }
         }
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Using www.youtube.com instead of music.youtube.com for better yt-dlp compatibility
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             
-            # Safely extract the stream URL
+            # Safely extract the stream URL from the formats list
             stream_url = info.get('url')
             if not stream_url and 'formats' in info:
-                # Fallback: manually find the best audio-only format
+                best_audio = None
                 for f in info['formats']:
                     if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                        stream_url = f['url']
-                        break
+                        if best_audio is None or f.get('abr', 0) > best_audio.get('abr', 0):
+                            best_audio = f
+                if best_audio:
+                    stream_url = best_audio['url']
+                elif info['formats']:
+                    stream_url = info['formats'][-1]['url']
             
             if stream_url:
                 stream_cache[video_id] = stream_url
