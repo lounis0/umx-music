@@ -2,6 +2,7 @@ import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from ytmusicapi import YTMusic
+import yt_dlp
 import requests
 
 app = Flask(__name__)
@@ -37,37 +38,58 @@ def get_stream(video_id):
     if video_id in stream_cache:
         return jsonify({"url": stream_cache[video_id]})
     
-    # Use Cobalt API to bypass YouTube's copyright and bot blocks
-    cobalt_instances = [
-        "https://co.wuk.sh/api/json",
-        "https://cobalt-api.kwiatekmiki.com/api/json",
-        "https://api.cobalt.tools/api/json"
+    # 1. Try yt-dlp first (in case it isn't blocked)
+    try:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web']
+                }
+            }
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            stream_url = info.get('url')
+            if not stream_url and 'formats' in info:
+                for f in info['formats']:
+                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                        stream_url = f['url']
+                        break
+            if stream_url:
+                stream_cache[video_id] = stream_url
+                return jsonify({"url": stream_url})
+    except Exception as e:
+        print(f"yt-dlp failed for {video_id}: {e}")
+    
+    # 2. Fallback to Piped API (Bypasses YouTube cloud blocks)
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://api.piped.yt"
     ]
     
-    payload = {
-        "url": f"https://youtu.be/{video_id}",
-        "isAudioOnly": True,
-        "aFormat": "mp3"
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    
-    for instance in cobalt_instances:
+    for instance in piped_instances:
         try:
-            res = requests.post(instance, json=payload, headers=headers, timeout=5)
+            res = requests.get(f"{instance}/streams/{video_id}", timeout=5)
             if res.status_code == 200:
                 data = res.json()
-                if data.get("status") == "stream" or data.get("status") == "redirect":
-                    stream_url = data.get("url")
+                if data.get('audioStreams'):
+                    best_audio = data['audioStreams'][0]
+                    for stream in data['audioStreams']:
+                        if stream.get('quality') == '256' or stream.get('quality', '0') > best_audio.get('quality', '0'):
+                            best_audio = stream
+                    stream_url = best_audio.get('url')
                     if stream_url:
                         stream_cache[video_id] = stream_url
                         return jsonify({"url": stream_url})
         except Exception as e:
-            print(f"Cobalt instance {instance} failed: {e}")
+            print(f"Piped instance {instance} failed: {e}")
             
-    return jsonify({"error": "All sources blocked by YouTube"}), 500
+    return jsonify({"error": "Could not extract audio URL from any source"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
