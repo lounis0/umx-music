@@ -85,7 +85,18 @@ def reset():
         
     save_posts([]) # Delete all posts
     return jsonify({"success": True, "message": "All posts deleted."})
+    
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+@app.route('/api/delete/<post_id>', methods=['DELETE'])
+def delete_post(post_id):
+    token = request.headers.get('Authorization')
+    if token not in VALID_TOKENS:
+        return jsonify({"error": "Unauthorized"}), 403
+        
+    posts = load_posts()
+    posts = [p for p in posts if p['id'] != post_id]
+    save_posts(posts)
+    return jsonify({"success": True})
