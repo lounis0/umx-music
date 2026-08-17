@@ -4,6 +4,8 @@ import uuid
 import requests
 import base64
 import tempfile
+import asyncio
+import threading
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 from telethon.sync import TelegramClient
@@ -25,13 +27,37 @@ GH_BRANCH = "main"
 
 DB_FILE = "files.json"
 
+# --- Telethon Background Thread Setup ---
+# This prevents the "asyncio event loop must not change" error in Gunicorn
+telethon_loop = asyncio.new_event_loop()
+telethon_thread = threading.Thread(target=telethon_loop.run_forever, daemon=True)
+telethon_thread.start()
+
+client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH, loop=telethon_loop)
+
+def run_async(coro):
+    """Helper to run async functions in the dedicated Telethon loop from Flask"""
+    return asyncio.run_coroutine_threadsafe(coro, telethon_loop).result()
+
+def connect_telethon():
+    try:
+        run_async(client.connect())
+        if not run_async(client.is_user_authorized()):
+            print("ERROR: Telegram session is invalid!")
+        else:
+            print("✅ Telethon Connected!")
+    except Exception as e:
+        print(f"Telethon Connection Error: {e}")
+
+def ensure_connected():
+    if not run_async(client.is_connected()):
+        print("Telethon disconnected. Reconnecting...")
+        run_async(client.connect())
+    if not run_async(client.is_user_authorized()):
+        raise Exception("Telegram session is invalid or expired.")
+
 print("Connecting Telethon...")
-client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
-client.connect()
-if not client.is_user_authorized():
-    print("ERROR: Telegram session is invalid!")
-else:
-    print("✅ Telethon Connected!")
+connect_telethon()
 
 # --- GitHub Database API ---
 def gh_get_db():
@@ -83,29 +109,32 @@ def scrape_history():
     
     new_files = []
     try:
-        if not client.is_connected():
-            client.connect()
-            
-        for msg in client.iter_messages(CHAT_ENTITY):
-            if msg.document:
-                if msg.id not in existing_msg_ids:
-                    file_name = ""
-                    for attr in msg.document.attributes:
-                        if hasattr(attr, 'file_name') and attr.file_name:
-                            file_name = attr.file_name
-                            break
-                    
-                    new_files.append({
-                        "id": str(uuid.uuid4())[:8],
-                        "name": file_name or f"file_{msg.id}",
-                        "title": file_name or f"file_{msg.id}",
-                        "description": "Scraped from history",
-                        "size": msg.document.size,
-                        "type": msg.document.mime_type or "file/octet-stream",
-                        "tg_id": msg.id,
-                        "date": msg.date.strftime("%Y-%m-%d %H:%M")
-                    })
-                    existing_msg_ids.add(msg.id)
+        ensure_connected()
+        
+        async def _scrape():
+            nonlocal new_files
+            async for msg in client.iter_messages(CHAT_ENTITY):
+                if msg.document:
+                    if msg.id not in existing_msg_ids:
+                        file_name = ""
+                        for attr in msg.document.attributes:
+                            if hasattr(attr, 'file_name') and attr.file_name:
+                                file_name = attr.file_name
+                                break
+                        
+                        new_files.append({
+                            "id": str(uuid.uuid4())[:8],
+                            "name": file_name or f"file_{msg.id}",
+                            "title": file_name or f"file_{msg.id}",
+                            "description": "Scraped from history",
+                            "size": msg.document.size,
+                            "type": msg.document.mime_type or "file/octet-stream",
+                            "tg_id": msg.id,
+                            "date": msg.date.strftime("%Y-%m-%d %H:%M")
+                        })
+                        existing_msg_ids.add(msg.id)
+        
+        run_async(_scrape())
     except Exception as e:
         print(f"Scrape Error: {e}")
 
@@ -115,14 +144,6 @@ def scrape_history():
         print(f"Scrape complete! Added {len(new_files)} old files.")
     else:
         print("Scrape complete. No new files found.")
-
-def ensure_connected():
-    """Ensures Telethon is awake and connected before doing operations"""
-    if not client.is_connected():
-        print("Telethon disconnected. Reconnecting...")
-        client.connect()
-    if not client.is_user_authorized():
-        raise Exception("Telegram session is invalid or expired.")
 
 @app.route('/')
 def home():
@@ -148,7 +169,10 @@ def upload_file():
         ensure_connected()
         file.save(temp_path)
         
-        msg = client.send_file(CHAT_ENTITY, temp_path, caption=f"UMS Upload: {title}")
+        async def _upload():
+            return await client.send_file(CHAT_ENTITY, temp_path, caption=f"UMS Upload: {title}")
+            
+        msg = run_async(_upload())
             
         if msg and msg.document:
             db = gh_get_db()
@@ -186,11 +210,14 @@ def download_file(file_id):
     
     try:
         ensure_connected()
-        msg = client.get_messages(CHAT_ENTITY, ids=file['tg_id'])
-        if not msg or not msg.document:
-            return jsonify({"error": "File not found on Telegram"}), 404
+        
+        async def _download():
+            msg = await client.get_messages(CHAT_ENTITY, ids=file['tg_id'])
+            if not msg or not msg.document:
+                return None
+            return await client.download_media(msg, file=temp_path)
             
-        client.download_media(msg, file=temp_path)
+        run_async(_download())
         
         def stream_and_delete():
             try:
@@ -223,7 +250,12 @@ def delete_file(file_id):
         
     try:
         ensure_connected()
-        client.delete_messages(CHAT_ENTITY, [file['tg_id']])
+        
+        async def _delete():
+            await client.delete_messages(CHAT_ENTITY, [file['tg_id']])
+            
+        run_async(_delete())
+        
         db = [f for f in db if f['id'] != file_id]
         gh_save_db(db)
         return jsonify({"success": True})
