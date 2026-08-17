@@ -15,7 +15,6 @@ from telethon.sessions import StringSession
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Explicitly allow CORS on all responses, even 500 errors
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -44,9 +43,20 @@ telethon_thread.start()
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH, loop=telethon_loop)
 
 def run_async(coro):
-    """Helper to run async functions in the dedicated Telethon loop with a timeout"""
     future = asyncio.run_coroutine_threadsafe(coro, telethon_loop)
-    return future.result(timeout=120) # 2 minute timeout for large uploads
+    # Removed the strict timeout. Let Gunicorn handle the 120s timeout.
+    return future.result() 
+
+async def init_telethon():
+    print("Connecting Telethon...")
+    await client.connect()
+    if not await client.is_user_authorized():
+        print("ERROR: Telegram session is invalid!")
+    else:
+        print("✅ Telethon Connected & Authorized!")
+
+# Connect immediately on startup
+run_async(init_telethon())
 
 def ensure_connected():
     async def _task():
@@ -56,13 +66,6 @@ def ensure_connected():
         if not await client.is_user_authorized():
             raise Exception("Telegram session is invalid or expired.")
     run_async(_task())
-
-print("Connecting Telethon on startup...")
-try:
-    ensure_connected()
-    print("✅ Telethon Connected!")
-except Exception as e:
-    print(f"Startup Telethon Error: {e}")
 
 # --- GitHub Database API ---
 def gh_get_db():
@@ -153,8 +156,10 @@ def upload_file():
             return jsonify({"error": "Telegram did not return a valid document."}), 500
             
     except Exception as e:
-        print(f"UPLOAD ERROR: {traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
+        # THIS WILL NOW PRINT THE EXACT ERROR TO YOUR BROWSER TOAST
+        err_trace = traceback.format_exc()
+        print(f"UPLOAD ERROR: {err_trace}")
+        return jsonify({"error": str(err_trace)[-500:]}), 500
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -198,8 +203,9 @@ def download_file(file_id):
         return Response(stream_with_context(stream_and_delete()), headers=headers)
         
     except Exception as e:
-        print(f"DOWNLOAD ERROR: {traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
+        err_trace = traceback.format_exc()
+        print(f"DOWNLOAD ERROR: {err_trace}")
+        return jsonify({"error": str(err_trace)[-500:]}), 500
 
 @app.route('/api/delete/<file_id>', methods=['DELETE'])
 def delete_file(file_id):
@@ -220,7 +226,6 @@ def delete_file(file_id):
         gh_save_db(db)
         return jsonify({"success": True})
     except Exception as e:
-        print(f"DELETE ERROR: {traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
-
-# No __main__ block needed because Gunicorn loads the app directly
+        err_trace = traceback.format_exc()
+        print(f"DELETE ERROR: {err_trace}")
+        return jsonify({"error": str(err_trace)[-500:]}), 500
