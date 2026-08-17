@@ -19,8 +19,8 @@ SESSION_STR = os.environ.get("TELEGRAM_SESSION_STRING", "")
 CHAT_ENTITY = os.environ.get("TELEGRAM_CHAT", "me")
 
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GH_OWNER = os.environ.get("GITHUB_OWNER", "")
-GH_REPO = os.environ.get("GITHUB_REPO", "")
+GH_OWNER = os.environ.get("GITHUB_OWNER", "lounis0")
+GH_REPO = os.environ.get("GITHUB_REPO", "umx-database")
 GH_BRANCH = "main"
 
 DB_FILE = "files.json"
@@ -40,11 +40,13 @@ except Exception as e:
 def gh_get_db():
     url = f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{DB_FILE}"
     try:
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, timeout=10)
         if res.status_code == 200:
             return res.json()
-    except:
-        pass
+        else:
+            print(f"GitHub Get DB Error: {res.status_code} - {res.text}")
+    except Exception as e:
+        print(f"GitHub Get DB Exception: {e}")
     return []
 
 def gh_save_db(db):
@@ -53,11 +55,11 @@ def gh_save_db(db):
     
     sha = None
     try:
-        get_res = requests.get(f"{url}?ref={GH_BRANCH}", headers=headers)
+        get_res = requests.get(f"{url}?ref={GH_BRANCH}", headers=headers, timeout=10)
         if get_res.status_code == 200:
             sha = get_res.json().get("sha")
-    except:
-        pass
+    except Exception as e:
+        print(f"GitHub Get SHA Exception: {e}")
 
     payload = {
         "message": "UMS: Update database",
@@ -68,9 +70,13 @@ def gh_save_db(db):
         payload["sha"] = sha
         
     try:
-        requests.put(url, headers=headers, json=payload, timeout=10)
+        res = requests.put(url, headers=headers, json=payload, timeout=15)
+        if res.status_code in [200, 201]:
+            print("✅ Database saved to GitHub!")
+        else:
+            print(f"GitHub Save DB Error: {res.status_code} - {res.text}")
     except Exception as e:
-        print(f"GitHub Save Error: {e}")
+        print(f"GitHub Save DB Exception: {e}")
 
 # --- Scraper ---
 def scrape_history():
@@ -79,26 +85,29 @@ def scrape_history():
     existing_msg_ids = {f['tg_id'] for f in db}
     
     new_files = []
-    for msg in client.iter_messages(CHAT_ENTITY):
-        if msg.document:
-            if msg.id not in existing_msg_ids:
-                file_name = ""
-                for attr in msg.document.attributes:
-                    if hasattr(attr, 'file_name') and attr.file_name:
-                        file_name = attr.file_name
-                        break
-                
-                new_files.append({
-                    "id": str(uuid.uuid4())[:8],
-                    "name": file_name or f"file_{msg.id}",
-                    "title": file_name or f"file_{msg.id}",
-                    "description": "Scraped from history",
-                    "size": msg.document.size,
-                    "type": msg.document.mime_type or "file/octet-stream",
-                    "tg_id": msg.id,
-                    "date": msg.date.strftime("%Y-%m-%d %H:%M")
-                })
-                existing_msg_ids.add(msg.id)
+    try:
+        for msg in client.iter_messages(CHAT_ENTITY):
+            if msg.document:
+                if msg.id not in existing_msg_ids:
+                    file_name = ""
+                    for attr in msg.document.attributes:
+                        if hasattr(attr, 'file_name') and attr.file_name:
+                            file_name = attr.file_name
+                            break
+                    
+                    new_files.append({
+                        "id": str(uuid.uuid4())[:8],
+                        "name": file_name or f"file_{msg.id}",
+                        "title": file_name or f"file_{msg.id}",
+                        "description": "Scraped from history",
+                        "size": msg.document.size,
+                        "type": msg.document.mime_type or "file/octet-stream",
+                        "tg_id": msg.id,
+                        "date": msg.date.strftime("%Y-%m-%d %H:%M")
+                    })
+                    existing_msg_ids.add(msg.id)
+    except Exception as e:
+        print(f"Scrape Error: {e}")
 
     if new_files:
         db.extend(new_files)
