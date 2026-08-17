@@ -26,15 +26,12 @@ GH_BRANCH = "main"
 DB_FILE = "files.json"
 
 print("Connecting Telethon...")
-try:
-    client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
-    client.connect()
-    if not client.is_user_authorized():
-        print("ERROR: Telegram session is invalid!")
-    else:
-        print("✅ Telethon Connected!")
-except Exception as e:
-    print(f"Telethon Connection Error: {e}")
+client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+client.connect()
+if not client.is_user_authorized():
+    print("ERROR: Telegram session is invalid!")
+else:
+    print("✅ Telethon Connected!")
 
 # --- GitHub Database API ---
 def gh_get_db():
@@ -86,6 +83,9 @@ def scrape_history():
     
     new_files = []
     try:
+        if not client.is_connected():
+            client.connect()
+            
         for msg in client.iter_messages(CHAT_ENTITY):
             if msg.document:
                 if msg.id not in existing_msg_ids:
@@ -116,6 +116,14 @@ def scrape_history():
     else:
         print("Scrape complete. No new files found.")
 
+def ensure_connected():
+    """Ensures Telethon is awake and connected before doing operations"""
+    if not client.is_connected():
+        print("Telethon disconnected. Reconnecting...")
+        client.connect()
+    if not client.is_user_authorized():
+        raise Exception("Telegram session is invalid or expired.")
+
 @app.route('/')
 def home():
     return "UMS Robust Backend Running!"
@@ -134,14 +142,13 @@ def upload_file():
     title = request.form.get('title', filename)
     description = request.form.get('description', '')
     
+    temp_path = tempfile.mktemp()
+    
     try:
-        temp_path = tempfile.mktemp()
+        ensure_connected()
         file.save(temp_path)
         
         msg = client.send_file(CHAT_ENTITY, temp_path, caption=f"UMS Upload: {title}")
-        
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
             
         if msg and msg.document:
             db = gh_get_db()
@@ -158,9 +165,15 @@ def upload_file():
             db.append(new_file)
             gh_save_db(db)
             return jsonify({"success": True, "file": new_file})
+        else:
+            return jsonify({"error": "Telegram did not return a valid document."}), 500
             
     except Exception as e:
+        print(f"UPLOAD ERROR: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 @app.route('/api/download/<file_id>')
 def download_file(file_id):
@@ -169,8 +182,10 @@ def download_file(file_id):
     if not file:
         return jsonify({"error": "File not found"}), 404
         
+    temp_path = tempfile.mktemp()
+    
     try:
-        temp_path = tempfile.mktemp()
+        ensure_connected()
         msg = client.get_messages(CHAT_ENTITY, ids=file['tg_id'])
         if not msg or not msg.document:
             return jsonify({"error": "File not found on Telegram"}), 404
@@ -196,6 +211,7 @@ def download_file(file_id):
         return Response(stream_with_context(stream_and_delete()), headers=headers)
         
     except Exception as e:
+        print(f"DOWNLOAD ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/delete/<file_id>', methods=['DELETE'])
@@ -206,11 +222,13 @@ def delete_file(file_id):
         return jsonify({"error": "File not found"}), 404
         
     try:
+        ensure_connected()
         client.delete_messages(CHAT_ENTITY, [file['tg_id']])
         db = [f for f in db if f['id'] != file_id]
         gh_save_db(db)
         return jsonify({"success": True})
     except Exception as e:
+        print(f"DELETE ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
