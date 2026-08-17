@@ -35,22 +35,9 @@ telethon_thread.start()
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH, loop=telethon_loop)
 
 def run_async(coro):
-    """Helper to run async functions in the dedicated Telethon loop from Flask"""
-    return asyncio.run_coroutine_threadsafe(coro, telethon_loop).result()
-
-def connect_telethon():
-    async def _task():
-        await client.connect()
-        return await client.is_user_authorized()
-        
-    try:
-        auth = run_async(_task())
-        if not auth:
-            print("ERROR: Telegram session is invalid!")
-        else:
-            print("✅ Telethon Connected!")
-    except Exception as e:
-        print(f"Telethon Connection Error: {e}")
+    """Helper to run async functions in the dedicated Telethon loop with a timeout"""
+    future = asyncio.run_coroutine_threadsafe(coro, telethon_loop)
+    return future.result(timeout=120) # 2 minute timeout for large uploads
 
 def ensure_connected():
     async def _task():
@@ -59,11 +46,55 @@ def ensure_connected():
             await client.connect()
         if not await client.is_user_authorized():
             raise Exception("Telegram session is invalid or expired.")
-            
     run_async(_task())
 
-print("Connecting Telethon...")
-connect_telethon()
+# Initialize Telegram IMMEDIATELY when Gunicorn loads (not in __main__)
+print("Connecting Telethon on startup...")
+try:
+    ensure_connected()
+    print("✅ Telethon Connected!")
+    
+    # Scrape history in background so it doesn't block startup
+    def bg_scrape():
+        try:
+            db = gh_get_db()
+            existing_msg_ids = {f['tg_id'] for f in db}
+            new_files = []
+            
+            async def _scrape():
+                async for msg in client.iter_messages(CHAT_ENTITY):
+                    if msg.document and msg.id not in existing_msg_ids:
+                        file_name = ""
+                        for attr in msg.document.attributes:
+                            if hasattr(attr, 'file_name') and attr.file_name:
+                                file_name = attr.file_name
+                                break
+                        new_files.append({
+                            "id": str(uuid.uuid4())[:8],
+                            "name": file_name or f"file_{msg.id}",
+                            "title": file_name or f"file_{msg.id}",
+                            "description": "Scraped from history",
+                            "size": msg.document.size,
+                            "type": msg.document.mime_type or "file/octet-stream",
+                            "tg_id": msg.id,
+                            "date": msg.date.strftime("%Y-%m-%d %H:%M")
+                        })
+                        existing_msg_ids.add(msg.id)
+            
+            run_async(_scrape())
+            if new_files:
+                db.extend(new_files)
+                gh_save_db(db)
+                print(f"Scrape complete! Added {len(new_files)} old files.")
+            else:
+                print("Scrape complete. No new files found.")
+        except Exception as e:
+            print(f"Background Scrape Error: {e}")
+
+    threading.Thread(target=bg_scrape, daemon=True).start()
+
+except Exception as e:
+    print(f"Startup Telethon Error: {e}")
 
 # --- GitHub Database API ---
 def gh_get_db():
@@ -72,8 +103,6 @@ def gh_get_db():
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
             return res.json()
-        else:
-            print(f"GitHub Get DB Error: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"GitHub Get DB Exception: {e}")
     return []
@@ -87,8 +116,8 @@ def gh_save_db(db):
         get_res = requests.get(f"{url}?ref={GH_BRANCH}", headers=headers, timeout=10)
         if get_res.status_code == 200:
             sha = get_res.json().get("sha")
-    except Exception as e:
-        print(f"GitHub Get SHA Exception: {e}")
+    except:
+        pass
 
     payload = {
         "message": "UMS: Update database",
@@ -106,49 +135,6 @@ def gh_save_db(db):
             print(f"GitHub Save DB Error: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"GitHub Save DB Exception: {e}")
-
-# --- Scraper ---
-def scrape_history():
-    print("Scraping Telegram history...")
-    db = gh_get_db()
-    existing_msg_ids = {f['tg_id'] for f in db}
-    
-    new_files = []
-    try:
-        ensure_connected()
-        
-        async def _scrape():
-            async for msg in client.iter_messages(CHAT_ENTITY):
-                if msg.document:
-                    if msg.id not in existing_msg_ids:
-                        file_name = ""
-                        for attr in msg.document.attributes:
-                            if hasattr(attr, 'file_name') and attr.file_name:
-                                file_name = attr.file_name
-                                break
-                        
-                        new_files.append({
-                            "id": str(uuid.uuid4())[:8],
-                            "name": file_name or f"file_{msg.id}",
-                            "title": file_name or f"file_{msg.id}",
-                            "description": "Scraped from history",
-                            "size": msg.document.size,
-                            "type": msg.document.mime_type or "file/octet-stream",
-                            "tg_id": msg.id,
-                            "date": msg.date.strftime("%Y-%m-%d %H:%M")
-                        })
-                        existing_msg_ids.add(msg.id)
-        
-        run_async(_scrape())
-    except Exception as e:
-        print(f"Scrape Error: {e}")
-
-    if new_files:
-        db.extend(new_files)
-        gh_save_db(db)
-        print(f"Scrape complete! Added {len(new_files)} old files.")
-    else:
-        print("Scrape complete. No new files found.")
 
 @app.route('/')
 def home():
@@ -268,7 +254,4 @@ def delete_file(file_id):
         print(f"DELETE ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    scrape_history()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+# No __main__ block needed because Gunicorn loads the app directly
