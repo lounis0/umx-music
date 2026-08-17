@@ -2,87 +2,118 @@ import os
 import json
 import uuid
 import requests
+import base64
+import tempfile
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
-import time
+from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
 
 app = Flask(__name__)
 CORS(app)
 
-BOT_TOKEN = os.environ.get("TG_TOKEN", "missing_token")
-CHAT_ID = os.environ.get("TG_CHAT", "missing_chat")
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Environment Variables
+API_ID = int(os.environ.get("TELEGRAM_API_ID", 0))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+SESSION_STR = os.environ.get("TELEGRAM_SESSION_STRING", "")
+CHAT_ENTITY = os.environ.get("TELEGRAM_CHAT", "me")
+
+GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GH_OWNER = os.environ.get("GITHUB_OWNER", "")
+GH_REPO = os.environ.get("GITHUB_REPO", "")
+GH_BRANCH = "main"
+
 DB_FILE = "files.json"
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return []
+print("Connecting Telethon...")
+try:
+    client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+    client.connect()
+    if not client.is_user_authorized():
+        print("ERROR: Telegram session is invalid!")
+    else:
+        print("✅ Telethon Connected!")
+except Exception as e:
+    print(f"Telethon Connection Error: {e}")
+
+# --- GitHub Database API ---
+def gh_get_db():
+    url = f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{DB_FILE}"
+    try:
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        pass
     return []
 
-def save_db(db):
-    with open(DB_FILE, 'w') as f:
-        json.dump(db, f)
-
-# Auto-fetch ALL previous files from the Telegram Bot's chat history on startup
-def sync_telegram_history():
-    print("Syncing all previous files from Telegram history...")
-    db = load_db()
-    existing_ids = {f['tg_id'] for f in db}
+def gh_save_db(db):
+    url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/contents/{DB_FILE}"
+    headers = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     
-    offset = 0
-    while True:
-        try:
-            res = requests.get(f"{TELEGRAM_API}/getUpdates?offset={offset}&limit=100")
-            if res.status_code != 200:
-                break
+    sha = None
+    try:
+        get_res = requests.get(f"{url}?ref={GH_BRANCH}", headers=headers)
+        if get_res.status_code == 200:
+            sha = get_res.json().get("sha")
+    except:
+        pass
+
+    payload = {
+        "message": "UMS: Update database",
+        "content": base64.b64encode(json.dumps(db, indent=4).encode()).decode(),
+        "branch": GH_BRANCH
+    }
+    if sha:
+        payload["sha"] = sha
+        
+    try:
+        requests.put(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"GitHub Save Error: {e}")
+
+# --- Scraper ---
+def scrape_history():
+    print("Scraping Telegram history...")
+    db = gh_get_db()
+    existing_msg_ids = {f['tg_id'] for f in db}
+    
+    new_files = []
+    for msg in client.iter_messages(CHAT_ENTITY):
+        if msg.document:
+            if msg.id not in existing_msg_ids:
+                file_name = ""
+                for attr in msg.document.attributes:
+                    if hasattr(attr, 'file_name') and attr.file_name:
+                        file_name = attr.file_name
+                        break
                 
-            updates = res.json().get('result', [])
-            if not updates:
-                break
-                
-            new_files_added = False
-            for update in updates:
-                offset = update['update_id'] + 1
-                msg = update.get('message')
-                if msg and 'document' in msg:
-                    doc = msg['document']
-                    if doc['file_id'] not in existing_ids:
-                        db.append({
-                            "id": str(uuid.uuid4())[:8],
-                            "name": doc['file_name'],
-                            "title": doc['file_name'],
-                            "description": "Imported from Telegram history",
-                            "size": doc['file_size'],
-                            "type": doc.get('mime_type', "file/octet-stream"),
-                            "tg_id": doc['file_id'],
-                            "date": "Previous"
-                        })
-                        existing_ids.add(doc['file_id'])
-                        new_files_added = True
-                        
-            if new_files_added:
-                save_db(db)
-                print(f"Imported {len(db)} total files so far...")
-                
-        except Exception as e:
-            print(f"Sync error: {e}")
-            break
-            
-    save_db(db)
-    print(f"Sync complete! Total files in database: {len(db)}")
+                new_files.append({
+                    "id": str(uuid.uuid4())[:8],
+                    "name": file_name or f"file_{msg.id}",
+                    "title": file_name or f"file_{msg.id}",
+                    "description": "Scraped from history",
+                    "size": msg.document.size,
+                    "type": msg.document.mime_type or "file/octet-stream",
+                    "tg_id": msg.id,
+                    "date": msg.date.strftime("%Y-%m-%d %H:%M")
+                })
+                existing_msg_ids.add(msg.id)
+
+    if new_files:
+        db.extend(new_files)
+        gh_save_db(db)
+        print(f"Scrape complete! Added {len(new_files)} old files.")
+    else:
+        print("Scrape complete. No new files found.")
 
 @app.route('/')
 def home():
-    return "UMS Backend is running! Previous files synced."
+    return "UMS Robust Backend Running!"
 
-@app.route('/api/files', methods=['GET'])
+@app.route('/api/files')
 def get_files():
-    db = load_db()
-    return jsonify(db[::-1])
+    return jsonify(gh_get_db()[::-1])
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
@@ -95,67 +126,85 @@ def upload_file():
     description = request.form.get('description', '')
     
     try:
-        url = f"{TELEGRAM_API}/sendDocument"
-        files = {'document': (filename, file.stream, file.mimetype)}
-        data = {'chat_id': CHAT_ID, 'disable_notification': True}
-        resp = requests.post(url, files=files, data=data, timeout=120)
+        temp_path = tempfile.mktemp()
+        file.save(temp_path)
         
-        if resp.status_code == 200:
-            result = resp.json()['result']
-            file_id = result['document']['file_id']
-            file_size = result['document']['file_size']
+        msg = client.send_file(CHAT_ENTITY, temp_path, caption=f"UMS Upload: {title}")
+        
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
             
-            db = load_db()
+        if msg and msg.document:
+            db = gh_get_db()
             new_file = {
                 "id": str(uuid.uuid4())[:8],
                 "name": filename,
                 "title": title,
                 "description": description,
-                "size": file_size,
-                "type": file.mimetype or "file/octet-stream",
-                "tg_id": file_id,
+                "size": msg.document.size,
+                "type": msg.document.mime_type or "file/octet-stream",
+                "tg_id": msg.id,
                 "date": "Just now"
             }
             db.append(new_file)
-            save_db(db)
+            gh_save_db(db)
             return jsonify({"success": True, "file": new_file})
-        return jsonify({"error": "Telegram upload failed", "details": resp.text}), 500
+            
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/download/<file_id>', methods=['GET'])
+@app.route('/api/download/<file_id>')
 def download_file(file_id):
-    db = load_db()
+    db = gh_get_db()
     file = next((f for f in db if f['id'] == file_id), None)
     if not file:
         return jsonify({"error": "File not found"}), 404
         
     try:
-        resp = requests.get(f"{TELEGRAM_API}/getFile?file_id={file['tg_id']}")
-        file_path = resp.json()['result']['file_path']
-        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        temp_path = tempfile.mktemp()
+        msg = client.get_messages(CHAT_ENTITY, ids=file['tg_id'])
+        if not msg or not msg.document:
+            return jsonify({"error": "File not found on Telegram"}), 404
+            
+        client.download_media(msg, file=temp_path)
         
-        req = requests.get(download_url, stream=True)
+        def stream_and_delete():
+            try:
+                with open(temp_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(8192)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
         headers = {
             "Content-Disposition": f"attachment; filename={file['name']}",
             "Content-Type": "application/octet-stream"
         }
-        return Response(stream_with_context(req.iter_content(chunk_size=8192)), headers=headers)
+        return Response(stream_with_context(stream_and_delete()), headers=headers)
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/delete/<file_id>', methods=['DELETE'])
 def delete_file(file_id):
-    db = load_db()
-    db = [f for f in db if f['id'] != file_id]
-    save_db(db)
-    return jsonify({"success": True})
+    db = gh_get_db()
+    file = next((f for f in db if f['id'] == file_id), None)
+    if not file:
+        return jsonify({"error": "File not found"}), 404
+        
+    try:
+        client.delete_messages(CHAT_ENTITY, [file['tg_id']])
+        db = [f for f in db if f['id'] != file_id]
+        gh_save_db(db)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8000))
-    
-    # Run sync in the background
-    import threading
-    threading.Thread(target=sync_telegram_history, daemon=True).start()
-    
+    scrape_history()
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
