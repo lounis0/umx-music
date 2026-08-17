@@ -6,13 +6,22 @@ import base64
 import tempfile
 import asyncio
 import threading
+import traceback
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Explicitly allow CORS on all responses, even 500 errors
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
 
 # Environment Variables
 API_ID = int(os.environ.get("TELEGRAM_API_ID", 0))
@@ -47,6 +56,13 @@ def ensure_connected():
         if not await client.is_user_authorized():
             raise Exception("Telegram session is invalid or expired.")
     run_async(_task())
+
+print("Connecting Telethon on startup...")
+try:
+    ensure_connected()
+    print("✅ Telethon Connected!")
+except Exception as e:
+    print(f"Startup Telethon Error: {e}")
 
 # --- GitHub Database API ---
 def gh_get_db():
@@ -87,54 +103,6 @@ def gh_save_db(db):
             print(f"GitHub Save DB Error: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"GitHub Save DB Exception: {e}")
-
-# --- Initialize Telegram & Scrape on Startup ---
-print("Connecting Telethon on startup...")
-try:
-    ensure_connected()
-    print("✅ Telethon Connected!")
-    
-    # Scrape history in background so it doesn't block startup
-    def bg_scrape():
-        try:
-            db = gh_get_db()
-            existing_msg_ids = {f['tg_id'] for f in db}
-            new_files = []
-            
-            async def _scrape():
-                async for msg in client.iter_messages(CHAT_ENTITY):
-                    if msg.document and msg.id not in existing_msg_ids:
-                        file_name = ""
-                        for attr in msg.document.attributes:
-                            if hasattr(attr, 'file_name') and attr.file_name:
-                                file_name = attr.file_name
-                                break
-                        new_files.append({
-                            "id": str(uuid.uuid4())[:8],
-                            "name": file_name or f"file_{msg.id}",
-                            "title": file_name or f"file_{msg.id}",
-                            "description": "Scraped from history",
-                            "size": msg.document.size,
-                            "type": msg.document.mime_type or "file/octet-stream",
-                            "tg_id": msg.id,
-                            "date": msg.date.strftime("%Y-%m-%d %H:%M")
-                        })
-                        existing_msg_ids.add(msg.id)
-            
-            run_async(_scrape())
-            if new_files:
-                db.extend(new_files)
-                gh_save_db(db)
-                print(f"Scrape complete! Added {len(new_files)} old files.")
-            else:
-                print("Scrape complete. No new files found.")
-        except Exception as e:
-            print(f"Background Scrape Error: {e}")
-
-    threading.Thread(target=bg_scrape, daemon=True).start()
-
-except Exception as e:
-    print(f"Startup Telethon Error: {e}")
 
 # --- Flask Routes ---
 @app.route('/')
@@ -185,7 +153,7 @@ def upload_file():
             return jsonify({"error": "Telegram did not return a valid document."}), 500
             
     except Exception as e:
-        print(f"UPLOAD ERROR: {e}")
+        print(f"UPLOAD ERROR: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
     finally:
         if os.path.exists(temp_path):
@@ -230,7 +198,7 @@ def download_file(file_id):
         return Response(stream_with_context(stream_and_delete()), headers=headers)
         
     except Exception as e:
-        print(f"DOWNLOAD ERROR: {e}")
+        print(f"DOWNLOAD ERROR: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/delete/<file_id>', methods=['DELETE'])
@@ -252,5 +220,7 @@ def delete_file(file_id):
         gh_save_db(db)
         return jsonify({"success": True})
     except Exception as e:
-        print(f"DELETE ERROR: {e}")
+        print(f"DELETE ERROR: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
+
+# No __main__ block needed because Gunicorn loads the app directly
