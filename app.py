@@ -26,7 +26,6 @@ GH_REPO = os.environ.get("GITHUB_REPO", "umx-database")
 GH_BRANCH = "main"
 
 DB_FILE = "files.json"
-
 # --- Telethon Background Thread Setup ---
 # This prevents the "asyncio event loop must not change" error in Gunicorn
 telethon_loop = asyncio.new_event_loop()
@@ -50,15 +49,12 @@ def connect_telethon():
         print(f"Telethon Connection Error: {e}")
 
 def ensure_connected():
-    if not run_async(client.is_connected()):
+    # FIX: is_connected() is synchronous in Telethon, so we don't wrap it in run_async()
+    if not client.is_connected():
         print("Telethon disconnected. Reconnecting...")
         run_async(client.connect())
     if not run_async(client.is_user_authorized()):
         raise Exception("Telegram session is invalid or expired.")
-
-print("Connecting Telethon...")
-connect_telethon()
-
 # --- GitHub Database API ---
 def gh_get_db():
     url = f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{DB_FILE}"
