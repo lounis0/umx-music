@@ -8,7 +8,7 @@ import asyncio
 import threading
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
-from telethon.sync import TelegramClient
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 app = Flask(__name__)
@@ -26,8 +26,8 @@ GH_REPO = os.environ.get("GITHUB_REPO", "umx-database")
 GH_BRANCH = "main"
 
 DB_FILE = "files.json"
+
 # --- Telethon Background Thread Setup ---
-# This prevents the "asyncio event loop must not change" error in Gunicorn
 telethon_loop = asyncio.new_event_loop()
 telethon_thread = threading.Thread(target=telethon_loop.run_forever, daemon=True)
 telethon_thread.start()
@@ -39,9 +39,13 @@ def run_async(coro):
     return asyncio.run_coroutine_threadsafe(coro, telethon_loop).result()
 
 def connect_telethon():
+    async def _task():
+        await client.connect()
+        return await client.is_user_authorized()
+        
     try:
-        run_async(client.connect())
-        if not run_async(client.is_user_authorized()):
+        auth = run_async(_task())
+        if not auth:
             print("ERROR: Telegram session is invalid!")
         else:
             print("✅ Telethon Connected!")
@@ -49,12 +53,18 @@ def connect_telethon():
         print(f"Telethon Connection Error: {e}")
 
 def ensure_connected():
-    # FIX: is_connected() is synchronous in Telethon, so we don't wrap it in run_async()
-    if not client.is_connected():
-        print("Telethon disconnected. Reconnecting...")
-        run_async(client.connect())
-    if not run_async(client.is_user_authorized()):
-        raise Exception("Telegram session is invalid or expired.")
+    async def _task():
+        if not client.is_connected():
+            print("Telethon disconnected. Reconnecting...")
+            await client.connect()
+        if not await client.is_user_authorized():
+            raise Exception("Telegram session is invalid or expired.")
+            
+    run_async(_task())
+
+print("Connecting Telethon...")
+connect_telethon()
+
 # --- GitHub Database API ---
 def gh_get_db():
     url = f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{DB_FILE}"
@@ -108,7 +118,6 @@ def scrape_history():
         ensure_connected()
         
         async def _scrape():
-            nonlocal new_files
             async for msg in client.iter_messages(CHAT_ENTITY):
                 if msg.document:
                     if msg.id not in existing_msg_ids:
